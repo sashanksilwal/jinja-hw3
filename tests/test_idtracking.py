@@ -1,3 +1,4 @@
+from jinja2 import meta
 from jinja2 import nodes
 from jinja2.idtracking import symbols_for_node
 
@@ -288,3 +289,15 @@ def test_if_branching_multi_scope():
         "l_1_item": ("param", None),
         "l_1_expression": ("resolve", "expression"),
     }
+
+
+def test_overlay_context_before_conditional_store(env):
+    ast = env.parse(
+        "{% if flag %}{% set x = 1 %}{% else %}{% set x = 2 %}{% endif %}{{ x }}"
+    )
+    overlay = nodes.OverlayScope(
+        nodes.Name("x", "load"), [nodes.Output([nodes.Name("key", "load")])]
+    )
+    ast.body.insert(0, overlay.set_lineno(1))
+    assert meta.find_undeclared_variables(ast) == {"flag", "key", "x"}
+    assert env.from_string(ast).render(flag=True, x={"key": "outer"}) == "outer1"

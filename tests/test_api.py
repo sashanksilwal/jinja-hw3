@@ -187,6 +187,134 @@ class TestMeta:
         )
         assert meta.find_undeclared_variables(ast) == {"control"}
 
+    @pytest.mark.parametrize(
+        ("source", "expected"),
+        [
+            pytest.param(
+                "{% if a %}{% set x = 1 %}{% else %}{% set x = 2 %}{% endif %}",
+                {"a"},
+                id="if-else",
+            ),
+            pytest.param(
+                "{% if a %}{% set x = 1 %}{% elif b %}{% set x = 2 %}{% endif %}",
+                {"a", "b", "x"},
+                id="implicit-fallthrough",
+            ),
+            pytest.param(
+                "{% if a %}{% set x = 1 %}{% elif b %}{% elif c %}{% set x = 2 %}"
+                "{% else %}{% set x = 3 %}{% endif %}",
+                {"a", "b", "c", "x"},
+                id="empty-middle-arm",
+            ),
+            pytest.param(
+                "{% if a %}{% if b %}{% set x = 1 %}{% else %}{% set x = 2 %}"
+                "{% endif %}{% else %}{% set x = 3 %}{% endif %}",
+                {"a", "b"},
+                id="nested-exhaustive",
+            ),
+            pytest.param(
+                "{% if a %}{% if b %}{% set x = 1 %}{% endif %}"
+                "{% else %}{% set x = 3 %}{% endif %}",
+                {"a", "b", "x"},
+                id="nested-fallthrough",
+            ),
+            pytest.param(
+                "{% if a %}{% set x = 1 %}{% set y = 2 %}"
+                "{% else %}{% set x = 3 %}{% endif %}{{ y }}",
+                {"a", "y"},
+                id="independent-names",
+            ),
+            pytest.param(
+                "{% if a %}{% set x = 1 %}{% with %}{{ x }}{% endwith %}"
+                "{% else %}{% set x = 2 %}{% endif %}",
+                {"a"},
+                id="child-read-after-store",
+            ),
+            pytest.param(
+                "{% if a %}{% for x in [1] %}{{ x }}{% endfor %}{% set x = 1 %}"
+                "{% else %}{% set x = 2 %}{% endif %}",
+                {"a"},
+                id="shadowed-loop-target",
+            ),
+        ],
+    )
+    def test_conditional_assignment_paths(self, env, source, expected):
+        assert meta.find_undeclared_variables(env.parse(source + "{{ x }}")) == expected
+
+    @pytest.mark.parametrize(
+        ("source", "context", "expected", "rendered"),
+        [
+            pytest.param(
+                "{% if a %}{% set x = 1 %}{% elif x %}{% set x = 2 %}"
+                "{% else %}{% set x = 3 %}{% endif %}",
+                {"a": False, "x": True},
+                {"a", "x"},
+                "2",
+                id="elif-guard",
+            ),
+            pytest.param(
+                "{% if a %}{% set x = x + 1 %}{% else %}{% set x = 3 %}{% endif %}",
+                {"a": True, "x": 9},
+                {"a", "x"},
+                "10",
+                id="read-before-store",
+            ),
+            pytest.param(
+                "{% if a %}{% set x = 1 %}{% elif b %}{% set x = 2 %}{% endif %}",
+                {"a": False, "b": False, "x": 9},
+                {"a", "b", "x"},
+                "9",
+                id="context-fallback",
+            ),
+            pytest.param(
+                "{% with %}{{ x }}{% endwith %}"
+                "{% if a %}{% set x = 1 %}{% else %}{% set x = 2 %}{% endif %}",
+                {"a": True, "x": 9},
+                {"a", "x"},
+                "91",
+                id="earlier-child-read",
+            ),
+            pytest.param(
+                "{% if a %}{% with %}{{ x }}{% endwith %}{% set x = 1 %}"
+                "{% else %}{% set x = 2 %}{% endif %}",
+                {"a": True, "x": 9},
+                {"a", "x"},
+                "91",
+                id="child-read-in-arm",
+            ),
+            pytest.param(
+                "{% set y | replace('A', x) %}A{% endset %}{{ y }}"
+                "{% if a %}{% set x = 1 %}{% else %}{% set x = 2 %}{% endif %}",
+                {"a": True, "x": "S"},
+                {"a", "x"},
+                "S1",
+                id="capture-filter-input",
+            ),
+            pytest.param(
+                "{% set x = 9 %}{% if a %}{% set x = 3 %}{% endif %}",
+                {"a": False},
+                {"a"},
+                "9",
+                id="previous-local",
+            ),
+        ],
+    )
+    def test_conditional_assignment_inputs(
+        self, env, source, context, expected, rendered
+    ):
+        source += "{{ x }}"
+        assert meta.find_undeclared_variables(env.parse(source)) == expected
+        assert env.from_string(source).render(context) == rendered
+
+    def test_conditional_assignment_macro_default(self, env):
+        source = (
+            "{% macro show(value=kwargs) %}{{ value }}{% endmacro %}{{ show() }}"
+            "{% if a %}{% set kwargs = 1 %}{% else %}{% set kwargs = 2 %}{% endif %}"
+            "{{ kwargs }}"
+        )
+        assert meta.find_undeclared_variables(env.parse(source)) == {"a", "kwargs"}
+        assert env.from_string(source).render(a=True, kwargs="outer") == "outer1"
+
     def test_find_refererenced_templates(self, env):
         ast = env.parse('{% extends "layout.html" %}{% include helper %}')
         i = meta.find_referenced_templates(ast)

@@ -45,6 +45,8 @@ class Symbols:
         self.refs: t.Dict[str, str] = {}
         self.loads: t.Dict[str, t.Any] = {}
         self.stores: t.Set[str] = set()
+        self._store_order: t.Dict[str, int] = {}
+        self.child_scopes: t.Set[_ChildScope] = set()
 
     def analyze_node(self, node: nodes.Node, **kwargs: t.Any) -> None:
         visitor = RootVisitor(self)
@@ -92,10 +94,16 @@ class Symbols:
         rv.refs = self.refs.copy()
         rv.loads = self.loads.copy()
         rv.stores = self.stores.copy()
+        rv._store_order = self._store_order.copy()
+        rv.child_scopes = self.child_scopes.copy()
         return rv
 
-    def store(self, name: str) -> None:
+    def _record_store(self, name: str) -> None:
+        self._store_order.setdefault(name, len(self.stores))
         self.stores.add(name)
+
+    def store(self, name: str) -> None:
+        self._record_store(name)
 
         # If we have not see the name referenced yet, we need to figure
         # out what to set it to.
@@ -113,7 +121,7 @@ class Symbols:
             self._define_ref(name, load=(VAR_LOAD_UNDEFINED, None))
 
     def declare_parameter(self, name: str) -> str:
-        self.stores.add(name)
+        self._record_store(name)
         return self._define_ref(name, load=(VAR_LOAD_PARAMETER, None))
 
     def load(self, name: str) -> None:
@@ -131,11 +139,20 @@ class Symbols:
         for sym in branch_symbols:
             self.refs.update(sym.refs)
             self.loads.update(sym.loads)
-            self.stores.update(sym.stores)
+            self.child_scopes.update(sym.child_scopes)
 
         for name in stores:
+            self._record_store(name)
             target = self.find_ref(name)
             assert target is not None, "should not happen"
+
+            # A missing else contributes an empty branch. A prior read, even
+            # in just one arm, must retain the incoming value.
+            if all(
+                branch.loads.get(target) == (VAR_LOAD_UNDEFINED, None)
+                for branch in branch_symbols
+            ) and not any(scope.reads(name) for scope in self.child_scopes):
+                continue
 
             if self.parent is not None:
                 outer_target = self.parent.find_ref(name)
@@ -171,6 +188,46 @@ class Symbols:
         return rv
 
 
+class _ChildScope:
+    """A nested scope that may read an enclosing local before its first store."""
+
+    def __init__(
+        self, node: nodes.Node, branch: str, store_order: t.Dict[str, int]
+    ) -> None:
+        self.node = node
+        self.branch = branch
+        # Share the frame's first-store positions. Copying every visible name
+        # at every child would take quadratic space for a sequence of scopes.
+        self.store_order = store_order
+        self.position = len(store_order)
+        self.symbols: t.Optional[Symbols] = None
+
+    def reads(self, name: str) -> bool:
+        if self.store_order.get(name, self.position) < self.position:
+            return False
+
+        # Most frames never need this check. Inspect the child only when
+        # deciding whether an exhaustive conditional can drop a context load.
+        if self.symbols is None:
+            from .compiler import find_undeclared
+
+            self.symbols = Symbols()
+            if isinstance(self.node, nodes.For) and self.branch == "body":
+                if find_undeclared(self.node.body, ("loop",)):
+                    self.symbols.declare_parameter("loop")
+            elif isinstance(self.node, (nodes.Macro, nodes.CallBlock)):
+                for param in find_undeclared(
+                    self.node.body, ("caller", "kwargs", "varargs")
+                ):
+                    self.symbols.declare_parameter(param)
+            self.symbols.analyze_node(self.node, for_branch=self.branch)
+
+        ref = self.symbols.refs.get(name)
+        if ref is not None and self.symbols.loads[ref][0] == VAR_LOAD_RESOLVE:
+            return True
+        return any(scope.reads(name) for scope in self.symbols.child_scopes)
+
+
 class RootVisitor(NodeVisitor):
     def __init__(self, symbols: "Symbols") -> None:
         self.sym_visitor = FrameSymbolVisitor(symbols)
@@ -190,6 +247,8 @@ class RootVisitor(NodeVisitor):
     def visit_AssignBlock(self, node: nodes.AssignBlock, **kwargs: t.Any) -> None:
         for child in node.body:
             self.sym_visitor.visit(child)
+        if node.filter is not None:
+            self.sym_visitor.visit(node.filter)
 
     def visit_CallBlock(self, node: nodes.CallBlock, **kwargs: t.Any) -> None:
         for child in node.iter_child_nodes(exclude=("call",)):
@@ -262,12 +321,20 @@ class FrameSymbolVisitor(NodeVisitor):
             self.symbols = original_symbols
             return rv
 
-        body_symbols = inner_visit(node.body)
-        elif_symbols = inner_visit(node.elif_)
-        else_symbols = inner_visit(node.else_ or ())
-        self.symbols.branch_update([body_symbols, elif_symbols, else_symbols])
+        branches = [inner_visit(node.body)]
+        for elif_node in node.elif_:
+            # No earlier arm's stores are visible in a later guard or body.
+            self.visit(elif_node.test, **kwargs)
+            branches.append(inner_visit(elif_node.body))
+        branches.append(inner_visit(node.else_))
+        self.symbols.branch_update(branches)
+
+    def _record_child(self, node: nodes.Node, branch: str = "body") -> None:
+        scope = _ChildScope(node, branch, self.symbols._store_order)
+        self.symbols.child_scopes.add(scope)
 
     def visit_Macro(self, node: nodes.Macro, **kwargs: t.Any) -> None:
+        self._record_child(node)
         self.symbols.store(node.name)
 
     def visit_Import(self, node: nodes.Import, **kwargs: t.Any) -> None:
@@ -293,26 +360,36 @@ class FrameSymbolVisitor(NodeVisitor):
         is visited as part of the outer scope.
         """
         self.visit(node.iter, **kwargs)
+        self._record_child(node, "body")
+        if node.test is not None:
+            self._record_child(node, "test")
+        if node.else_:
+            self._record_child(node, "else")
 
     def visit_CallBlock(self, node: nodes.CallBlock, **kwargs: t.Any) -> None:
         self.visit(node.call, **kwargs)
+        self._record_child(node)
 
     def visit_FilterBlock(self, node: nodes.FilterBlock, **kwargs: t.Any) -> None:
         self.visit(node.filter, **kwargs)
+        self._record_child(node)
 
     def visit_With(self, node: nodes.With, **kwargs: t.Any) -> None:
         for target in node.values:
             self.visit(target)
+        self._record_child(node)
 
     def visit_AssignBlock(self, node: nodes.AssignBlock, **kwargs: t.Any) -> None:
         """Stop visiting at block assigns."""
+        self._record_child(node)
         self.visit(node.target, **kwargs)
 
     def visit_Scope(self, node: nodes.Scope, **kwargs: t.Any) -> None:
-        """Stop visiting at scopes."""
+        self._record_child(node)
 
     def visit_Block(self, node: nodes.Block, **kwargs: t.Any) -> None:
         """Stop visiting at blocks."""
 
     def visit_OverlayScope(self, node: nodes.OverlayScope, **kwargs: t.Any) -> None:
-        """Do not visit into overlay scopes."""
+        # The overlay mapping itself is evaluated in the enclosing frame.
+        self.visit(node.context, **kwargs)
